@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+*.egg-info/
+
+# Data & cache (runtime-generated)
+DATA/
+cache/
+*.db
+*.db-journal
+*.csv
+*.log
+
+# PyInstaller temp
+*.manifest
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Scratch files
+scratch_assemble.py
+test_diag.py
+test_output.log
