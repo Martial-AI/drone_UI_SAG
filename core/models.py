@@ -54,3 +54,19 @@ class AlertEntry:
     def __post_init__(self) -> None:
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
+
+    @property
+    def bg_color(self) -> str:
+        return {
+            "critical": "#7f1d1d",
+            "warning":  "#78350f",
+            "info":     "#0f2d4a",
+        }.get(self.level, "#0f2d4a")
+
+    @property
+    def fg_color(self) -> str:
+        return {
+            "critical": "#fca5a5",
+            "warning":  "#fde68a",
+            "info":     "#7dd3fc",
+        }.get(self.level, "#c9d8ec")
