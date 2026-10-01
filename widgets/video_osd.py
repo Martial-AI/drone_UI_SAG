@@ -59,7 +59,7 @@ class VideoOSDWidget(QWidget):
         # Video frame cache
         self._current_frame: QImage | None = None
         self._current_pixmap: QPixmap | None = None
-        self._no_signal_text = "NO VIDEO SIGNAL"
+        #self._no_signal_text = "NO VIDEO SIGNAL"
 
         # Blink/pulse phase for tactical indicators
         self._pulse_phase = 0.0
@@ -96,6 +96,7 @@ class VideoOSDWidget(QWidget):
 
     def set_language(self, language: str) -> None:
         self._language = language
+        self.update()
 
     def update_frame(self, frame: QImage | None) -> None:
         self._current_frame = frame
@@ -137,8 +138,10 @@ class VideoOSDWidget(QWidget):
         self.update()
 
     def _on_anim_tick(self) -> None:
+        if not self.isVisible():
+            return
         self._pulse_phase = (self._pulse_phase + 0.1) % (2 * np.pi)
-        if self._osd_mode != self.MODE_OFF:
+        if self._osd_mode != self.MODE_OFF and self._current_pixmap is None:
             self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -166,20 +169,21 @@ class VideoOSDWidget(QWidget):
 
         # 1. Background / Video frame
         if self._current_pixmap is not None and not self._current_pixmap.isNull():
-            # Scale video preserving aspect ratio, letterbox centered
-            scaled = self._current_pixmap.scaled(rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x_pos = (rect.width() - scaled.width()) // 2
-            y_pos = (rect.height() - scaled.height()) // 2
+            pm_size = self._current_pixmap.size()
+            scaled_size = pm_size.scaled(rect.size(), Qt.KeepAspectRatio)
+            x_pos = (rect.width() - scaled_size.width()) // 2
+            y_pos = (rect.height() - scaled_size.height()) // 2
+            dest_rect = QRectF(x_pos, y_pos, scaled_size.width(), scaled_size.height())
+
             painter.fillRect(rect, QColor("#000000"))
-            painter.drawPixmap(x_pos, y_pos, scaled)
+            painter.drawPixmap(dest_rect, self._current_pixmap, QRectF(self._current_pixmap.rect()))
         else:
             # Standby tactical grid
             painter.fillRect(rect, QColor("#060a12"))
-            self._draw_standby_grid(painter, rect)
+            #self._draw_standby_grid(painter, rect)
 
         # If OSD is OFF, only show a tiny discreet mode badge at top right
         if self._osd_mode == self.MODE_OFF:
-            self._draw_mode_toggle_badge(painter, rect)
             return
 
         # 2. Central Artificial Horizon & Reticle
@@ -192,16 +196,31 @@ class VideoOSDWidget(QWidget):
         self._draw_aircraft_reticle(painter, center_x, center_y)
 
         # 3. Side Tapes (Speed left, Altitude right) in FULL mode
-        if self._osd_mode == self.MODE_FULL:
-            self._draw_speed_tape(painter, rect)
-            self._draw_altitude_tape(painter, rect)
-            self._draw_compass_ribbon(painter, rect)
+        
 
         # 4. Top Header Banner (Mode, Arm, Battery, Sats, Clock)
-        self._draw_top_banner(painter, rect)
+        
 
         # 5. OSD Mode Switcher Badge (top-right click target)
-        self._draw_mode_toggle_badge(painter, rect)
+        # NO VIDEO SIGNAL warning above bottom control buttons
+        if self._current_pixmap is None or self._current_pixmap.isNull():
+            pulse_alpha = int(80 + 175 * np.sin(self._pulse_phase))
+            painter.setPen(QColor(255, 0, 0, pulse_alpha))
+            painter.setFont(QFont("Segoe UI", 16, QFont.Bold))
+
+            signal_rect = QRectF(
+                0,
+                rect.height() - 95,
+                rect.width(),
+                35,
+            )
+
+            no_sig_text = "AUCUN SIGNAL VIDÉO" if self._language == "fr" else "NO VIDEO SIGNAL"
+            painter.drawText(
+                signal_rect,
+                Qt.AlignCenter,
+                no_sig_text,
+            )
 
     def _draw_standby_grid(self, painter: QPainter, rect: QRectF) -> None:
         painter.setPen(QPen(QColor(16, 40, 70, 70), 1, Qt.DotLine))
@@ -212,10 +231,7 @@ class VideoOSDWidget(QWidget):
             painter.drawLine(0, y, int(rect.width()), y)
 
         # Warning text
-        pulse_alpha = int(170 + 85 * np.sin(self._pulse_phase))
-        painter.setPen(QColor(0, 212, 255, pulse_alpha))
-        painter.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        painter.drawText(rect, Qt.AlignCenter, f"⚡ {self._no_signal_text} ⚡")
+
 
     def _draw_aircraft_reticle(self, painter: QPainter, cx: float, cy: float) -> None:
         """Fixed aircraft reticle (center crosshair & wings)."""

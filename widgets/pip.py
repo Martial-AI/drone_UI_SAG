@@ -114,13 +114,21 @@ class PipWindowWidget(QFrame):
         self.map_widget.controls_visible = False
         self.stack.addWidget(self.map_widget)
 
-        # Mini Video
-        self.video_label = QLabel("NO SIGNAL")
+        self._language = "en"
+        self.video_label = QLabel("NO VIDEO SIGNAL")
         self.video_label.setObjectName("pipVideoLabel")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.stack.addWidget(self.video_label)
 
         self.set_content_mode(self.MODE_MAP)
+
+    def _no_signal_text(self) -> str:
+        return "AUCUN SIGNAL VIDÉO" if getattr(self, "_language", "en") == "fr" else "NO VIDEO SIGNAL"
+
+    def set_language(self, language: str) -> None:
+        self._language = language
+        if self._current_frame is None:
+            self.video_label.setText(self._no_signal_text())
 
     def set_content_mode(self, mode: str) -> None:
         """Switch between mini-map or mini-video in the PiP container."""
@@ -139,13 +147,15 @@ class PipWindowWidget(QFrame):
 
     def update_video_frame(self, frame: QImage | None) -> None:
         self._current_frame = frame
+        if not self.isVisible() or self._mode != self.MODE_VIDEO:
+            return
         if frame is None:
             self.video_label.setPixmap(QPixmap())
-            self.video_label.setText("NO SIGNAL")
+            self.video_label.setText(self._no_signal_text())
             return
         pix = QPixmap.fromImage(frame)
         self.video_label.setText("")
-        self.video_label.setPixmap(pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video_label.setPixmap(pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
 
     def update_telemetry(self, data: SensorData) -> None:
         if self._mode == self.MODE_MAP:

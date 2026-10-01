@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from config import splash_logo_path
@@ -30,6 +31,8 @@ from core.utils import clamp
 class DashboardCard(QFrame):
     """Futuristic HUD card with technical corner ticks, top glow, and header LED."""
 
+    hold_activated = Signal()
+
     def __init__(self, title: str, subtitle: str | None = None, *, compact: bool = False) -> None:
         super().__init__()
         self.setFrameShape(QFrame.StyledPanel)
@@ -38,6 +41,7 @@ class DashboardCard(QFrame):
         self.subtitle = subtitle
         self.compact = compact
         self.theme = "dark"
+        self.active_state = False
 
         self.layout = QVBoxLayout(self)
         if compact:
@@ -53,6 +57,40 @@ class DashboardCard(QFrame):
             subtitle_label.setObjectName("cardSubtitle")
             subtitle_label.setWordWrap(True)
             self.layout.addWidget(subtitle_label)
+
+    def enable_hold(self, duration_ms: int = 2000) -> None:
+        """Enable long press (default 2s) on this card and its child widgets."""
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.setInterval(duration_ms)
+        self._hold_timer.timeout.connect(self.hold_activated.emit)
+        self.installEventFilter(self)
+        self.setCursor(Qt.PointingHandCursor)
+        for child in self.findChildren(QWidget):
+            child.installEventFilter(self)
+            child.setCursor(Qt.PointingHandCursor)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if hasattr(self, "_hold_timer"):
+            if event.type() == QEvent.MouseButtonPress:
+                if event.button() == Qt.LeftButton and not self._hold_timer.isActive():
+                    self._hold_timer.start()
+            elif event.type() == QEvent.MouseButtonRelease:
+                if event.button() == Qt.LeftButton:
+                    self._hold_timer.stop()
+        return super().eventFilter(watched, event)
+
+    def childEvent(self, event) -> None:  # noqa: N802
+        super().childEvent(event)
+        if hasattr(self, "_hold_timer") and event.type() == QEvent.ChildAdded:
+            child = event.child()
+            if isinstance(child, QWidget):
+                child.installEventFilter(self)
+                child.setCursor(Qt.PointingHandCursor)
+
+    def set_active_state(self, active: bool) -> None:
+        self.active_state = active
+        self.update()
 
     def set_theme(self, theme: str) -> None:
         self.theme = theme if theme in {"dark", "light"} else "dark"
@@ -75,7 +113,7 @@ class DashboardCard(QFrame):
             title_bg = QColor(220, 235, 248, 220)
             title_border = QColor(160, 200, 235, 200)
             title_fg = QColor("#1b3045")
-            led_col = QColor("#2196a8")
+            led_col = QColor("#1f9d60") if self.active_state else QColor("#2196a8")
             corner_col = QColor(160, 200, 235, 140)
         else:
             bg_top = QColor(14, 24, 42, 220)
@@ -86,7 +124,7 @@ class DashboardCard(QFrame):
             title_bg = QColor(10, 20, 38, 200)
             title_border = QColor(30, 80, 130, 200)
             title_fg = QColor("#7ec8f0")
-            led_col = QColor("#00e5ff")
+            led_col = QColor("#00e676") if self.active_state else QColor("#00e5ff")
             corner_col = QColor(30, 90, 150, 120)
 
         # Ambient glow

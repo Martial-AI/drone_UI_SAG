@@ -60,9 +60,9 @@ class VideoStreamReceiver(QThread):
         protocol = self._source_protocol()
         ffmpeg_options = None
         if protocol == "rtsp":
-            ffmpeg_options = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+            ffmpeg_options = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0"
         elif protocol == "udp":
-            ffmpeg_options = "fflags;nobuffer|flags;low_delay"
+            ffmpeg_options = "fflags;nobuffer|flags;low_delay|framedrop;1|max_delay;0"
 
         for backend, backend_name in self._backend_attempts(protocol):
             previous_options = self._set_ffmpeg_options(ffmpeg_options if backend == cv.CAP_FFMPEG else None)
@@ -83,7 +83,7 @@ class VideoStreamReceiver(QThread):
         capture.set(cv.CAP_PROP_BUFFERSIZE, 1)
         if protocol in {"rtsp", "udp"}:
             capture.set(cv.CAP_PROP_OPEN_TIMEOUT_MSEC, 2500)
-            capture.set(cv.CAP_PROP_READ_TIMEOUT_MSEC, 1200)
+            capture.set(cv.CAP_PROP_READ_TIMEOUT_MSEC, 1500)
         elif protocol == "http":
             capture.set(cv.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
             capture.set(cv.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
@@ -98,7 +98,8 @@ class VideoStreamReceiver(QThread):
         while self._running:
             capture, backend_name = self._open_capture()
             if capture is None:
-                self.stream_error.emit(f"{self.label} stream unavailable - retrying")
+                self.frame_received.emit(None)
+                self.stream_error.emit("Connexion de vidéo impossible")
                 self.msleep(2000)
                 continue
 
@@ -106,15 +107,18 @@ class VideoStreamReceiver(QThread):
             self.stream_status.emit(f"{self.label} stream connected ({backend_name})")
             failed_reads = 0
             last_emit_time = 0.0
-            emit_interval = 1.0 / 20.0
+            emit_interval = 1.0 / 30.0  # 30 fps fluid target
+
             while self._running:
-                ok, frame = capture.read()
-                if not ok or frame is None:
+                # Grab immediately to drain OpenCV/FFmpeg network buffers without delay
+                ok = capture.grab()
+                if not ok:
                     failed_reads += 1
-                    if failed_reads >= 60:
-                        self.stream_error.emit(f"{self.label} stream lost - reconnecting")
+                    if failed_reads >= 45:
+                        self.frame_received.emit(None)
+                        self.stream_error.emit("Connexion de vidéo impossible")
                         break
-                    self.msleep(25)
+                    self.msleep(10)
                     continue
                 failed_reads = 0
 
@@ -122,6 +126,11 @@ class VideoStreamReceiver(QThread):
                 if now - last_emit_time < emit_interval:
                     continue
                 last_emit_time = now
+
+                # Decode only the latest grabbed frame
+                ok, frame = capture.retrieve()
+                if not ok or frame is None:
+                    continue
 
                 rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
                 height, width, channels = rgb_frame.shape
@@ -138,7 +147,7 @@ class VideoStreamReceiver(QThread):
             capture.release()
             self._capture = None
             if self._running:
-                self.msleep(1200)
+                self.msleep(1000)
 
 
 class ThermalReceiver(QThread):

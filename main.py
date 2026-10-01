@@ -104,7 +104,7 @@ def main() -> int:
     window = MainWindow()
     animate_startup_splash(app, splash, 52, 76, "Connexion des services...", 900)
     window.show()
-    animate_startup_splash(app, splash, 76, 100, "Finalisation...", 1500)
+    animate_startup_splash(app, splash, 76, 100, "Finalisation...", 1500) 
     update_startup_splash(app, splash, 100, "Pret", 120)
     splash.close()
     return app.exec()

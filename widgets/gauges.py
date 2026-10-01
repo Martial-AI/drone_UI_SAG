@@ -199,7 +199,7 @@ class CompassWidget(QWidget):
         self.setMinimumSize(98, 98)
         self._animation_timer = QTimer(self)
         self._animation_timer.timeout.connect(self._animate_heading)
-        self._animation_timer.start(16)
+        self._animation_timer.start(33)
 
     def set_theme(self, theme: str) -> None:
         self.theme = theme if theme in {"dark", "light"} else "dark"
@@ -236,6 +236,8 @@ class CompassWidget(QWidget):
     def _animate_heading(self) -> None:
         delta = (self.heading - self.displayed_heading + 540.0) % 360.0 - 180.0
         if abs(delta) < 0.15:
+            if self.displayed_heading == self.heading:
+                return
             self.displayed_heading = self.heading
         else:
             self.displayed_heading = (self.displayed_heading + delta * 0.14) % 360.0

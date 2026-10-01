@@ -34,3 +34,7 @@ Thumbs.db
 scratch_assemble.py
 test_diag.py
 test_output.log
+
+# Backups & release
+*.backup*
+release/

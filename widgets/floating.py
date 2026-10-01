@@ -230,6 +230,10 @@ class FloatingScreenWidget(QFrame):
         for key, button in self.mode_buttons.items():
             button.setChecked(key == mode)
         self.title_label.setText(self._screen_title())
+        if mode == "live" and self._last_live_frame is not None:
+            self.update_video_frame("live", self._last_live_frame)
+        elif mode == "thermal" and self._last_thermal_frame is not None:
+            self.update_video_frame("thermal", self._last_thermal_frame)
 
     def update_sensor_data(self, data: SensorData) -> None:
         self.map_widget.update_from_data(data)
@@ -244,13 +248,15 @@ class FloatingScreenWidget(QFrame):
             label = self.thermal_label
         else:
             return
+        if not self.isVisible() or self.mode != mode:
+            return
         if frame is None:
             label.setPixmap(QPixmap())
             label.setText(self._text("no_signal"))
             return
         label.setText("")
         pixmap = QPixmap.fromImage(frame)
-        label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+        label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatioByExpanding, Qt.FastTransformation))
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)

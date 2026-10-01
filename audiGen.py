@@ -1,7 +1,7 @@
 import asyncio
 import edge_tts
 
-TEXT = "Danger! Danger! High Radiactive Zone!"
+TEXT = "Take Off in processing! Pull Up! Pull Up!"
 # Male voice
 VOICE_MALE = "en-US-GuyNeural"
 
@@ -11,6 +11,6 @@ VOICE_FEMALE = "en-US-JennyNeural"
 async def generate():
 
     communicate = edge_tts.Communicate(TEXT, VOICE_FEMALE)
-    await communicate.save("RadioDanger.mp3")
+    await communicate.save("TakeOff.mp3")
 
 asyncio.run(generate())

@@ -34,13 +34,16 @@ class ConnectionInterfaceDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Connexion reseau")
+        self.language = getattr(parent, "current_language", "fr")
+        texts = UI_TEXTS.get(self.language, UI_TEXTS["fr"])
+
+        self.setWindowTitle(texts.get("network_connection", "Connexion réseau"))
         self.resize(400, 210)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-        intro = QLabel("Choisir l'interface de connexion et renseigner le point d'acces.")
+        intro = QLabel(texts.get("network_connection_intro", "Choisir l'interface de connexion et renseigner le point d'accès."))
         intro.setWordWrap(True)
         intro.setObjectName("pageSubtitle")
         layout.addWidget(intro)
@@ -49,13 +52,13 @@ class ConnectionInterfaceDialog(QDialog):
         form.setHorizontalSpacing(10)
         form.setVerticalSpacing(10)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["UDP", "TCP", "SERIAL"])
-        self.mode_combo.setCurrentText(current_mode if current_mode in profiles else "UDP")
-        form.addRow("Interface", self.mode_combo)
+        self.mode_combo.addItems(["TCP", "SERIAL"])
+        self.mode_combo.setCurrentText(current_mode if current_mode in ("TCP", "SERIAL") else "TCP")
+        form.addRow(texts.get("interface", "Interface"), self.mode_combo)
 
         self.endpoint_input = QLineEdit()
         self.endpoint_input.setMinimumWidth(230)
-        form.addRow("Adresse", self.endpoint_input)
+        form.addRow(texts.get("address", "Adresse"), self.endpoint_input)
         layout.addLayout(form)
 
         self.hint_label = QLabel("")
@@ -64,10 +67,12 @@ class ConnectionInterfaceDialog(QDialog):
         layout.addWidget(self.hint_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        language = getattr(parent, "current_language", "en")
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setText(texts.get("connect", "Connexion"))
         cancel_button = buttons.button(QDialogButtonBox.Cancel)
         if cancel_button is not None:
-            cancel_button.setText(UI_TEXTS.get(language, UI_TEXTS["en"])["cancel"])
+            cancel_button.setText(texts.get("cancel", "Annuler"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -79,12 +84,13 @@ class ConnectionInterfaceDialog(QDialog):
     def _update_endpoint_hint(self, mode: str) -> None:
         endpoint = self._profiles.get(mode, "")
         self.endpoint_input.setText(endpoint)
+        texts = UI_TEXTS.get(getattr(self, "language", "fr"), UI_TEXTS["fr"])
         if mode == "SERIAL":
             self.endpoint_input.setPlaceholderText("COM3@115200")
-            self.hint_label.setText("Format serial: COM3@115200")
+            self.hint_label.setText(texts.get("serial_format_hint", "Format série : COM3@115200"))
         else:
             self.endpoint_input.setPlaceholderText("host:port")
-            self.hint_label.setText("Format reseau: host:port")
+            self.hint_label.setText(texts.get("network_format_hint", "Format réseau : host:port"))
 
     def connection_profile(self) -> tuple[str, str]:
         return self.mode_combo.currentText(), self.endpoint_input.text().strip()

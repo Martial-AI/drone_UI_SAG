@@ -179,6 +179,75 @@ from widgets import (
 )
 
 
+# ── Background writer : SQLite + CSV hors du thread UI ──────────────────────
+class DataWriterThread(QThread):
+    """Receives (row, db_params) tuples and writes them without blocking the UI."""
+
+    def __init__(self, database_path: str) -> None:
+        super().__init__()
+        self._queue: queue.Queue = queue.Queue(maxsize=500)
+        self._database_path = database_path
+        self._running = True
+
+    def enqueue(self, csv_row: list, db_params: tuple) -> None:
+        try:
+            self._queue.put_nowait((csv_row, db_params))
+        except queue.Full:
+            pass  # drop silently if saturated
+
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self._queue.put_nowait(None)  # unblock get()
+        except queue.Full:
+            pass
+
+    def run(self) -> None:
+        import sqlite3 as _sqlite3
+        import csv as _csv
+        import io
+        conn = _sqlite3.connect(self._database_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        while True:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self._running:
+                    break
+                continue
+            if item is None:
+                break
+            csv_row, db_params = item
+            # CSV : reconstruit la ligne dans un buffer mémoire
+            buf = io.StringIO()
+            writer = _csv.writer(buf)
+            writer.writerow(csv_row)
+            # Écrire dans le fichier CSV (thread-safe car seul ce thread écrit)
+            try:
+                with open(db_params[0], "a", newline="", encoding="utf-8") as f:
+                    f.write(buf.getvalue())
+            except Exception:
+                pass
+            # SQLite insert
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO telemetry_samples(
+                        session_id, recorded_at, time_label, co2, lpg, co, humidity,
+                        radiation, temperature, pitch, roll, heading, speed, altitude,
+                        battery, latitude, longitude
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    db_params[1:],  # skip log_file_path
+                )
+                conn.commit()
+            except Exception:
+                pass
+        conn.close()
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -228,30 +297,37 @@ class MainWindow(QMainWindow):
         self.map_download_cancelled = False
         self.log_file_path = make_data_log_path(directory=self.air_data_dir)
         self.database_path = database_file_path(self.data_dir)
-        self.log_handle = open(self.log_file_path, "w", newline="", encoding="utf-8")
-        self.csv_writer = csv.writer(self.log_handle)
-        self.csv_writer.writerow(
-            [
-                "Time",
-                "CO2",
-                "LPG",
-                "CO",
-                "Hum",
-                "Count",
-                "Temp",
-                "Pitch",
-                "Roll",
-                "Heading",
-                "Speed",
-                "Altitude",
-                "Battery",
-                "Latitude",
-                "Longitude",
-            ]
-        )
+        with open(self.log_file_path, "w", newline="", encoding="utf-8") as _init_f:
+            _init_writer = csv.writer(_init_f)
+            _init_writer.writerow(
+                [
+                    "Time",
+                    "CO2",
+                    "LPG",
+                    "CO",
+                    "Hum",
+                    "Count",
+                    "Temp",
+                    "Pitch",
+                    "Roll",
+                    "Heading",
+                    "Speed",
+                    "Altitude",
+                    "Battery",
+                    "Latitude",
+                    "Longitude",
+                ]
+            )
+        self.log_handle = None
+        self.csv_writer = None
         self.database = sqlite3.connect(self.database_path)
+        self.database.execute("PRAGMA journal_mode=WAL")
+        self.database.execute("PRAGMA synchronous=NORMAL")
         self._initialize_database()
         self.session_id = self._create_log_session()
+        # Thread d'écriture async (SQLite + CSV)
+        self._data_writer = DataWriterThread(self.database_path)
+        self._data_writer.start()
 
         self.telemetry_listener = TelemetryListener()
         self.thermal_receiver = ThermalReceiver()
@@ -268,18 +344,25 @@ class MainWindow(QMainWindow):
         self.thermal_stream_address = str(thermal_source.get("address", ""))
         self.link_worker: QThread | None = None
         self.network_connected = False
-        self.network_mode = "UDP"
+        self.network_connecting = False
+        self._connection_verify_time = 0.0
+        self._connection_timeout_timer = QTimer(self)
+        self._connection_timeout_timer.setSingleShot(True)
+        self._connection_timeout_timer.timeout.connect(self._handle_connection_timeout)
+        self.network_mode = "TCP"
         self.main_menu_popup: QMenu | None = None
         self.main_menu_anchor_pos = QPoint()
         self.keep_main_menu_open = False
         self.sounds_enabled = True
         self.connection_profiles = {
-            "UDP": f"{self.telemetry_listener.host}:{self.telemetry_listener.port}",
             "TCP": f"{self.command_client.host}:{self.command_client.port}",
             "SERIAL": "COM3@115200",
         }
         self.low_battery_alert_active = False
         self.low_battery_land_acknowledged = False
+        self.rtl_active = False
+        self.rtl_blinking = False
+        self.rtl_was_airborne = False
         self.low_battery_alert_alpha = 0.0
         self.low_battery_alert_direction = 1.0
         self.battery_alert_state = "normal"
@@ -292,7 +375,11 @@ class MainWindow(QMainWindow):
             "Scan": flight_mode_audio_path("Scan.mp3"),
             "Hold": flight_mode_audio_path("Hold.mp3"),
             "Stabilize": flight_mode_audio_path("Stab.mp3"),
+            "RTL": flight_mode_audio_path("RTL.mp3"),
         }
+        self.armed_audio_file = flight_mode_audio_path("armed.mp3")
+        self.disarmed_audio_file = flight_mode_audio_path("disarmed.mp3")
+        self.takeoff_audio_file = flight_mode_audio_path("TakeOff.mp3")
         self.low_battery_audio_output = QAudioOutput(self)
         self.low_battery_audio_output.setVolume(0.85)
         self.low_battery_player = QMediaPlayer(self)
@@ -302,7 +389,7 @@ class MainWindow(QMainWindow):
         self.low_battery_audio_timer.setInterval(15000)
         self.low_battery_audio_timer.timeout.connect(self._play_low_battery_audio)
         self.low_battery_flash_timer = QTimer(self)
-        self.low_battery_flash_timer.setInterval(16)
+        self.low_battery_flash_timer.setInterval(33)  # ~30 fps suffisant, évite saturer le thread UI
         self.low_battery_flash_timer.timeout.connect(self._update_low_battery_alert_visuals)
         self.radiation_spectrum_phase = 0.0
         self.radiation_spectrum_timer = QTimer(self)
@@ -968,15 +1055,9 @@ class MainWindow(QMainWindow):
         self.kill_button.setToolTip("ARRÊT D'URGENCE MOTEURS (Ctrl+Shift+K)")
         self.kill_button.setStyleSheet("background-color: #450a0a; color: #ef4444; font-weight: 800; border: 1px solid #ef4444; border-radius: 4px; padding: 3px 8px;")
 
-        self.shortcuts_btn = QPushButton("?")
-        self.shortcuts_btn.setToolTip("Aide raccourcis clavier (F1)")
-        self.shortcuts_btn.setFixedWidth(26)
-        self.shortcuts_btn.setStyleSheet("background-color: #1e293b; color: #94a3b8; font-weight: 700; border-radius: 4px;")
-
         crit_block.addWidget(self.arm_button, 2)
         crit_block.addWidget(self.takeoff_button, 2)
         crit_block.addWidget(self.kill_button, 2)
-        crit_block.addWidget(self.shortcuts_btn, 1)
         flight_mode_layout.addLayout(crit_block)
 
         top_center.addWidget(self.flight_mode_panel, 0, Qt.AlignHCenter)
@@ -1091,6 +1172,32 @@ class MainWindow(QMainWindow):
 
         self.display_card = DashboardCard("Display")
         center_column.addWidget(self.display_card, 10)
+
+        # ── Close button row for display_card ──────────────────────────────
+        self.display_close_button = QPushButton("✕")
+        self.display_close_button.setObjectName("displayCloseBtn")
+        self.display_close_button.setFixedSize(20, 20)
+        self.display_close_button.setToolTip(self._tr("close"))
+        self.display_close_button.setStyleSheet("""
+            QPushButton#displayCloseBtn {
+                background: rgba(255,60,60,0.15);
+                color: #ff6b6b;
+                border: 1px solid rgba(255,80,80,0.35);
+                border-radius: 4px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton#displayCloseBtn:hover {
+                background: rgba(255,60,60,0.45);
+                color: #fff;
+            }
+        """)
+        display_close_row = QHBoxLayout()
+        display_close_row.setContentsMargins(0, 0, 0, 0)
+        display_close_row.addStretch(1)
+        display_close_row.addWidget(self.display_close_button)
+        self.display_card.layout.addLayout(display_close_row)
+
         self.display_stack = QStackedWidget()
         self.display_card.layout.addWidget(self.display_stack, 1)
 
@@ -1153,12 +1260,9 @@ class MainWindow(QMainWindow):
         fullscreen_video_layout.addWidget(self.video_osd, 1)
 
         self.video_overlay = QLabel(central)
-        self.video_overlay.setAlignment(Qt.AlignCenter)
         self.video_overlay.setObjectName("videoOverlay")
-        self.video_overlay.setText("NO SIGNAL")
-        self.video_overlay.setStyleSheet(
-            "color: #ff4d4f; font-size: 28px; font-weight: 800;"
-        )
+        self.video_overlay.hide()
+
         self.video_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.video_overlay_effect = QGraphicsOpacityEffect(self.video_overlay)
         self.video_overlay.setGraphicsEffect(self.video_overlay_effect)
@@ -1275,6 +1379,10 @@ class MainWindow(QMainWindow):
             widget.hold_activated.connect(lambda key="gas": self._toggle_sensor(key))
         for widget in (self.humidity_gauge, self.temperature_gauge):
             widget.hold_activated.connect(lambda key="dht": self._toggle_sensor(key))
+        self.radiation_card.enable_hold(2000)
+        self.radiation_card.hold_activated.connect(lambda key="geiger": self._toggle_sensor(key))
+        self.radiation_card.setToolTip(self._tr("radiation_tooltip"))
+        self._apply_sensor_visual_state("geiger")
 
         # ── Panneau Alertes contextuelles ────────────────────────────────────
         self.alert_card = DashboardCard("Alertes de vol")
@@ -1732,6 +1840,8 @@ class MainWindow(QMainWindow):
             widget.set_theme(self.current_theme)
         for panel in self.floating_panels.values():
             panel.set_theme(self.current_theme)
+        if hasattr(self, "sensor_states") and "geiger" in self.sensor_states:
+            self._apply_sensor_visual_state("geiger")
 
     def _set_card_bounds(
         self,
@@ -1856,7 +1966,6 @@ class MainWindow(QMainWindow):
         menu.addAction(self._menu_toggle_action(menu, self._tr("flight_alerts"), "flight_alerts"))
         menu.addAction(self._menu_toggle_action(menu, self._tr("flight_log"), "flight_log"))
         menu.addAction(self._menu_toggle_action(menu, "PiP (Picture-in-Picture) (P)", "pip"))
-        menu.addAction(self._menu_toggle_action(menu, "OSD Telemetrie (O)", "osd"))
         menu.addSeparator()
         # Raccourcis clavier (F1)
         shortcuts_action = menu.addAction(f"⌨  {self._tr('shortcuts')} (F1)")
@@ -1937,7 +2046,6 @@ class MainWindow(QMainWindow):
         self.live_view_button.setText(self._tr("live"))
         self.thermal_view_button.setText(self._tr("thermal"))
         self.data_button.setText(self._tr("data"))
-        self.video_overlay.setText(self._tr("no_signal"))
         self.data_chart.set_language(self.current_language)
         if self.sender_label.text() in {"Waiting", "Attente"}:
             self.sender_label.setText(self._tr("waiting"))
@@ -1951,16 +2059,29 @@ class MainWindow(QMainWindow):
             UI_TEXTS["fr"]["data_live"],
         }:
             self.last_command_label.setText(self._tr("data_live"))
-        self.battery_alert_label.setText(
-            self._tr("auto_landing")
-            if self.battery_alert_state in {"critical", "landing"} or self.low_battery_land_acknowledged
-            else self._tr("low_battery")
-        )
+        if getattr(self, "rtl_active", False):
+            self.battery_alert_label.setText(self._tr("returning_to_launch"))
+        elif self.battery_alert_state in {"critical", "landing"} or self.low_battery_land_acknowledged:
+            self.battery_alert_label.setText(self._tr("auto_landing"))
+        else:
+            self.battery_alert_label.setText(self._tr("low_battery"))
         if hasattr(self, "floating_panels"):
             for panel in self.floating_panels.values():
                 panel.set_language(self.current_language)
+        if hasattr(self, "video_osd"):
+            self.video_osd.set_language(self.current_language)
+        if hasattr(self, "pip_window"):
+            self.pip_window.set_language(self.current_language)
+        if self.last_command_label.text() in {"Connexion de vidéo impossible", "Video connection impossible"}:
+            self.last_command_label.setText(
+                "Connexion de vidéo impossible" if self.current_language == "fr" else "Video connection impossible"
+            )
         if self.map_download_dialog is not None:
             self.map_download_dialog.set_language(self.current_language)
+        if hasattr(self, "display_close_button"):
+            self.display_close_button.setToolTip(self._tr("close"))
+        if hasattr(self, "radiation_card"):
+            self.radiation_card.setToolTip(self._tr("radiation_tooltip"))
         self._update_network_button()
 
     def _add_language_submenu(self, menu: QMenu) -> None:
@@ -1990,7 +2111,14 @@ class MainWindow(QMainWindow):
     def _set_sounds_enabled(self, enabled: bool) -> None:
         self.sounds_enabled = enabled
         if enabled:
-            if self.battery_alert_state == "low" and self.low_battery_warning_file:
+            if getattr(self, "rtl_active", False):
+                if getattr(self, "rtl_blinking", False) and self.landing_alert_audio_file:
+                    self._play_audio_file(
+                        self.landing_alert_audio_file,
+                        "rtl_alert_loop",
+                        loops=QMediaPlayer.Loops.Infinite,
+                    )
+            elif self.battery_alert_state == "low" and self.low_battery_warning_file:
                 self._play_low_battery_audio()
                 self.low_battery_audio_timer.start()
             elif self.battery_alert_state == "critical" or self.low_battery_land_acknowledged:
@@ -2151,7 +2279,6 @@ class MainWindow(QMainWindow):
         self.arm_button.clicked.connect(self._handle_arm_request)
         self.takeoff_button.clicked.connect(self._handle_takeoff_request)
         self.kill_button.clicked.connect(self._handle_emergency_kill_request)
-        self.shortcuts_btn.clicked.connect(self._show_shortcuts_dialog)
         self.network_apply_button.clicked.connect(self._toggle_network_interface)
         self.menu_button.clicked.connect(self._show_main_menu)
         self.map_view_button.short_clicked.connect(self._show_map_screen)
@@ -2166,6 +2293,7 @@ class MainWindow(QMainWindow):
         self.thermal_view_button.long_clicked.connect(lambda: self._configure_video_source("thermal"))
         self.data_button.short_clicked.connect(self._show_live_data_screen)
         self.data_button.long_clicked.connect(self._show_saved_data_screen)
+        self.display_close_button.clicked.connect(self.display_card.hide)
         self._set_flight_mode("Stabilize")
         self._show_map_screen()
         self._connect_background_services()
@@ -2187,9 +2315,26 @@ class MainWindow(QMainWindow):
 
     def _update_network_button(self) -> None:
         if self.network_connected:
-            self.network_apply_button.setText(self._tr("connected", mode=self.network_mode))
+            self.network_apply_button.setText(self._tr("connected"))
+            self.network_apply_button.setStyleSheet(
+                "QPushButton { color: #00e676; border-color: #00e676; font-weight: bold; }"
+            )
+            self.network_apply_button.setToolTip(f"{self._tr('connected')} ({self.network_mode})")
+        elif getattr(self, "network_connecting", False):
+            self.network_apply_button.setText(self._tr("connecting"))
+            self.network_apply_button.setStyleSheet(
+                "QPushButton { color: #f59e0b; border-color: #f59e0b; font-weight: bold; }"
+            )
+            self.network_apply_button.setToolTip(f"{self._tr('connecting')} ({self.network_mode})")
         else:
+            self.network_apply_button.setStyleSheet("")
             self.network_apply_button.setText(self._tr("connect"))
+            self.network_apply_button.setToolTip(self._tr("connect"))
+
+    def _reset_network_button_after_error(self) -> None:
+        """Reset the connect button appearance after a connection error."""
+        self.network_apply_button.setStyleSheet("")
+        self._update_network_button()
 
     def _parse_serial_profile(self, value: str) -> tuple[str, int]:
         text = value.strip()
@@ -2203,9 +2348,6 @@ class MainWindow(QMainWindow):
         return port_name.strip() or "COM3", baudrate
 
     def _build_link_worker(self, mode: str, profile: str) -> QThread:
-        if mode == "UDP":
-            host, port = self._parse_host_port(profile, "0.0.0.0", 12345)
-            return TelemetryListener(host=host, port=port)
         if mode == "TCP":
             host, port = self._parse_host_port(profile, "127.0.0.1", 12345)
             return TcpTelemetryListener(host=host, port=port)
@@ -2221,24 +2363,29 @@ class MainWindow(QMainWindow):
         self._disconnect_selected_interface()
         self.connection_profiles[mode] = profile
         self.network_mode = mode
+        self.network_connected = False
+        self.network_connecting = True
+        self._connection_verify_time = time.time()
         self.link_worker = self._build_link_worker(mode, profile)
         self._attach_link_worker(self.link_worker)
-        self.network_apply_button.setText(self._tr("connecting", mode=mode))
-        self.link_worker.start()
-        self.network_connected = True
         self._update_network_button()
+        self.link_worker.start()
         self.last_command_label.setText(f"{mode} connect requested: {profile}")
+        self._connection_timeout_timer.start(5000)
 
     def _disconnect_selected_interface(self) -> None:
+        if hasattr(self, "_connection_timeout_timer"):
+            self._connection_timeout_timer.stop()
         if self.link_worker is not None:
             self.link_worker.stop()  # type: ignore[attr-defined]
             self.link_worker.wait(1500)
             self.link_worker = None
+        self.network_connecting = False
         self.network_connected = False
         self._update_network_button()
 
     def _toggle_network_interface(self) -> None:
-        if self.network_connected:
+        if self.network_connected or getattr(self, "network_connecting", False):
             self._disconnect_selected_interface()
             self.last_command_label.setText("Network disconnected")
             return
@@ -2254,14 +2401,43 @@ class MainWindow(QMainWindow):
         self._connect_selected_interface(mode, profile)
 
     def _handle_link_status(self, message: str) -> None:
-        self.network_connected = True
-        self._update_network_button()
         self.last_command_label.setText(message)
+        if self.network_connected:
+            return
+
+        elapsed = time.time() - getattr(self, "_connection_verify_time", 0.0)
+        remaining_delay = max(0, int((0.8 - elapsed) * 1000))
+
+        def _confirm_connected() -> None:
+            if not getattr(self, "network_connecting", False):
+                return
+            if hasattr(self, "_connection_timeout_timer"):
+                self._connection_timeout_timer.stop()
+            self.network_connecting = False
+            self.network_connected = True
+            self._update_network_button()
+
+        if remaining_delay > 0:
+            QTimer.singleShot(remaining_delay, _confirm_connected)
+        else:
+            _confirm_connected()
 
     def _handle_link_error(self, message: str) -> None:
-        self.last_command_label.setText(message)
+        if hasattr(self, "_connection_timeout_timer"):
+            self._connection_timeout_timer.stop()
+        self.network_connecting = False
         self.network_connected = False
-        self._update_network_button()
+        self.last_command_label.setText(message)
+        # Afficher en rouge "Échec de connexion"
+        self.network_apply_button.setText(f"❌ {self._tr('connection_failed')}")
+        self.network_apply_button.setStyleSheet(
+            "QPushButton { color: #ff4444; border-color: #ff4444; font-weight: bold; }"
+        )
+        QTimer.singleShot(3000, self._reset_network_button_after_error)
+
+    def _handle_connection_timeout(self) -> None:
+        if getattr(self, "network_connecting", False) and not self.network_connected:
+            self._handle_link_error(self._tr("connection_failed"))
 
     def _relayout_science_gauges(self) -> None:
         while self.science_grid.count():
@@ -2287,14 +2463,25 @@ class MainWindow(QMainWindow):
 
     def _stop_video_stream(self, mode: str) -> None:
         worker = self.live_stream_worker if mode == "live" else self.thermal_stream_worker
-        if worker is None:
-            return
-        worker.stop()
-        worker.wait(1500)
+        if worker is not None:
+            worker.stop()
+            worker.wait(1500)
+            if mode == "live":
+                self.live_stream_worker = None
+            else:
+                self.thermal_stream_worker = None
         if mode == "live":
-            self.live_stream_worker = None
+            self.live_frame = None
         else:
-            self.thermal_stream_worker = None
+            self.thermal_frame = None
+        if hasattr(self, "video_osd") and self.active_video_mode == mode:
+            self.video_osd.update_frame(None)
+        if hasattr(self, "pip_window"):
+            self.pip_window.update_video_frame(None)
+        for panel in self.floating_panels.values():
+            panel.update_video_frame(mode, None)
+        if self.fullscreen_stack.currentWidget() is self.fullscreen_video_page and self.active_video_mode == mode:
+            self._show_no_signal_overlay()
 
     def _start_video_stream(self, mode: str, protocol: str, address: str) -> None:
         source_url = self._normalize_video_source(protocol, address)
@@ -2375,19 +2562,26 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons, 0, Qt.AlignRight)
         dialog.exec()
 
-    def _update_video_stream_frame(self, mode: str, frame: QImage) -> None:
+    def _update_video_stream_frame(self, mode: str, frame: QImage | None) -> None:
         if mode == "live":
             self.live_frame = frame
         else:
             self.thermal_frame = frame
 
         if self.fullscreen_stack.currentWidget() is self.fullscreen_video_page and self.active_video_mode == mode:
-            self.video_overlay.hide()
-            self._render_current_frame()
-        self._refresh_floating_panels()
+            if frame is None:
+                self._show_no_signal_overlay()
+            else:
+                self.video_overlay.hide()
+                self._render_current_frame()
+        for panel in self.floating_panels.values():
+            if panel.isVisible():
+                panel.update_video_frame(mode, frame)
 
     def _handle_video_stream_error(self, mode: str, message: str) -> None:
-        self.last_command_label.setText(message)
+        is_fr = self.current_language == "fr"
+        display_msg = "Connexion de vidéo impossible" if is_fr else "Video connection impossible"
+        self.last_command_label.setText(display_msg)
         if mode == "live":
             self.live_frame = None
             if self.live_stream_worker is not None and not self.live_stream_worker.isRunning():
@@ -2397,8 +2591,16 @@ class MainWindow(QMainWindow):
             if self.thermal_stream_worker is not None and not self.thermal_stream_worker.isRunning():
                 self.thermal_stream_worker = None
 
+        if hasattr(self, "video_osd") and self.active_video_mode == mode:
+            self.video_osd.update_frame(None)
+        if hasattr(self, "pip_window") and self.pip_window.isVisible():
+            self.pip_window.update_video_frame(None)
+        for panel in self.floating_panels.values():
+            if panel.isVisible():
+                panel.update_video_frame(mode, None)
+
         if self.fullscreen_stack.currentWidget() is self.fullscreen_video_page and self.active_video_mode == mode:
-            self._refresh_display_panel()
+            self._show_no_signal_overlay()
 
     def _set_flight_mode(self, mode: str) -> None:
         self.flight_mode = mode
@@ -2440,20 +2642,51 @@ class MainWindow(QMainWindow):
             return
 
         if mode == "Land":
+            if getattr(self, "rtl_active", False):
+                self._stop_rtl_alert()
             self._handle_land_mode_request()
             return
         if mode == "RTL":
             self._handle_rtl_mode_request()
             return
 
+        if getattr(self, "rtl_active", False):
+            self._stop_rtl_alert()
         if self.low_battery_land_acknowledged and self.battery_alert_state != "critical":
             self._stop_low_battery_alert()
         self._set_flight_mode(mode)
         self._play_flight_mode_audio(mode)
 
     def _handle_rtl_mode_request(self) -> None:
+        if self.low_battery_land_acknowledged and self.battery_alert_state != "critical":
+            self._stop_low_battery_alert()
+        self.rtl_active = True
+        self.rtl_blinking = False
+        self.rtl_was_airborne = self.current_data.altitude > 1.5
+        self.rtl_mode_button.setStyleSheet("")
         self._set_flight_mode("RTL")
         self.command_client.send_command("RTL")
+        self.battery_alert_label.setText(self._tr("returning_to_launch"))
+        if not self.low_battery_flash_timer.isActive():
+            self.low_battery_alert_alpha = 0.0
+            self.low_battery_alert_direction = 1.0
+            self.low_battery_flash_timer.start()
+        self._update_low_battery_alert_visuals()
+
+        rtl_audio = self.flight_mode_audio_files.get("RTL", "")
+        if rtl_audio and self.sounds_enabled:
+            self._play_audio_file(rtl_audio, "rtl_once", loops=QMediaPlayer.Loops.Once)
+        else:
+            self.rtl_blinking = True
+            if not self.low_battery_flash_timer.isActive():
+                self.low_battery_flash_timer.start()
+            if self.landing_alert_audio_file and self.sounds_enabled:
+                self._play_audio_file(
+                    self.landing_alert_audio_file,
+                    "rtl_alert_loop",
+                    loops=QMediaPlayer.Loops.Infinite,
+                )
+
         self.last_command_label.setText("Flight mode: RTL (Return to Base)")
         for log in (getattr(self, 'flight_log', None), getattr(self, 'flight_log_inline', None)):
             if log is not None:
@@ -2476,6 +2709,11 @@ class MainWindow(QMainWindow):
             if ActionConfirmationDialog.confirm(self, title, msg, level="warning", confirm_text="ARMER" if is_fr else "ARM MOTORS"):
                 self.is_armed = True
                 self.command_client.send_command("ARM")
+                self._play_audio_file(
+                    self.armed_audio_file,
+                    "armed",
+                    loops=QMediaPlayer.Loops.Once,
+                )
                 self._update_arm_button_visual()
                 self.last_command_label.setText("Drone: MOTORS ARMED")
                 # Journal de mission
@@ -2493,7 +2731,14 @@ class MainWindow(QMainWindow):
             msg = "Couper l'armement des moteurs maintenant ?" if is_fr else "Disarm motors now?"
             if ActionConfirmationDialog.confirm(self, title, msg, level="info", confirm_text="D\u00c9SARMER" if is_fr else "DISARM"):
                 self.is_armed = False
+                if getattr(self, "rtl_active", False):
+                    self._stop_rtl_alert()
                 self.command_client.send_command("DISARM")
+                self._play_audio_file(
+                    self.disarmed_audio_file,
+                    "disarmed",
+                    loops=QMediaPlayer.Loops.Once,
+                )
                 self._update_arm_button_visual()
                 self.last_command_label.setText("Drone: MOTORS DISARMED")
                 for log in (getattr(self, 'flight_log', None), getattr(self, 'flight_log_inline', None)):
@@ -2522,6 +2767,11 @@ class MainWindow(QMainWindow):
                 self.command_client.send_command("ARM")
                 self._update_arm_button_visual()
             self.command_client.send_command(f"TAKEOFF {alt:.1f}")
+            self._play_audio_file(
+                self.takeoff_audio_file,
+                "takeoff",
+                loops=QMediaPlayer.Loops.Once,
+            )
             self.last_command_label.setText(f"Takeoff ordered: {alt:.1f} m")
             for log in (getattr(self, 'flight_log', None), getattr(self, 'flight_log_inline', None)):
                 if log is not None:
@@ -2544,6 +2794,8 @@ class MainWindow(QMainWindow):
         if ActionConfirmationDialog.confirm(self, title, msg, level="danger", confirm_text="COUPER LES MOTEURS" if is_fr else "KILL MOTORS NOW"):
             self.command_client.send_command("KILL")
             self.is_armed = False
+            if getattr(self, "rtl_active", False):
+                self._stop_rtl_alert()
             self._update_arm_button_visual()
             self.last_command_label.setText("EMERGENCY KILL SWITCH TRIGGERED")
             for log in (getattr(self, 'flight_log', None), getattr(self, 'flight_log_inline', None)):
@@ -2670,6 +2922,33 @@ class MainWindow(QMainWindow):
                 "landing_loop",
                 loops=QMediaPlayer.Loops.Infinite,
             )
+            return
+        if self.low_battery_audio_mode == "rtl_once" and getattr(self, "rtl_active", False):
+            self.rtl_blinking = True
+            if not self.low_battery_flash_timer.isActive():
+                self.low_battery_flash_timer.start()
+            if self.landing_alert_audio_file:
+                self._play_audio_file(
+                    self.landing_alert_audio_file,
+                    "rtl_alert_loop",
+                    loops=QMediaPlayer.Loops.Infinite,
+                )
+            return
+
+    def _stop_rtl_alert(self) -> None:
+        self.rtl_active = False
+        self.rtl_blinking = False
+        self.rtl_was_airborne = False
+        self.rtl_mode_button.setStyleSheet("")
+        if not self.low_battery_alert_active:
+            self.battery_alert_effect.setOpacity(0.0)
+            self.battery_alert_label.setText(self._tr("low_battery"))
+        if self.low_battery_audio_mode in {"rtl_once", "rtl_alert_loop"}:
+            self.low_battery_audio_mode = "idle"
+            if self.low_battery_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+                self.low_battery_player.stop()
+        if not self.low_battery_alert_active:
+            self.low_battery_flash_timer.stop()
 
     def _play_low_battery_audio(self) -> None:
         if self.battery_alert_state != "low" or not self.low_battery_warning_file:
@@ -2722,10 +3001,14 @@ class MainWindow(QMainWindow):
             return
         self.low_battery_alert_active = False
         self.battery_alert_state = "normal"
-        self.low_battery_audio_mode = "idle"
+        if self.low_battery_audio_mode not in {"rtl_once", "rtl_alert_loop"}:
+            self.low_battery_audio_mode = "idle"
+            if self.low_battery_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+                self.low_battery_player.stop()
         self.low_battery_land_acknowledged = False
         self.low_battery_audio_timer.stop()
-        self.low_battery_flash_timer.stop()
+        if not getattr(self, "rtl_blinking", False):
+            self.low_battery_flash_timer.stop()
         self.low_battery_alert_alpha = 0.0
         self.low_battery_alert_direction = 1.0
         self.flight_batt_effect.setOpacity(1.0)
@@ -2733,14 +3016,17 @@ class MainWindow(QMainWindow):
         self.battery_alert_label.setText(self._tr("low_battery"))
         self._set_flight_mode_buttons_enabled(True)
         self.land_mode_button.setStyleSheet("")
-        if self.low_battery_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
-            self.low_battery_player.stop()
 
     def _update_battery_alert_state(self, battery_percent: int, landed: bool) -> None:
-        if landed and (self.battery_alert_state == "critical" or self.low_battery_land_acknowledged):
-            self._stop_low_battery_alert()
-            self.last_command_label.setText("Landing successful")
-            return
+        if landed:
+            if getattr(self, "rtl_active", False) and (getattr(self, "rtl_was_airborne", False) or getattr(self, "rtl_blinking", False)):
+                self._stop_rtl_alert()
+                self.last_command_label.setText("RTL landing confirmed")
+                return
+            if self.battery_alert_state == "critical" or self.low_battery_land_acknowledged:
+                self._stop_low_battery_alert()
+                self.last_command_label.setText("Landing successful")
+                return
         if self.low_battery_land_acknowledged:
             if self.battery_alert_state != "critical":
                 self._start_landing_visual_alert()
@@ -2758,10 +3044,14 @@ class MainWindow(QMainWindow):
             self._play_low_battery_audio()
 
     def _update_low_battery_alert_visuals(self) -> None:
-        if not self.low_battery_alert_active:
+        rtl_active = getattr(self, "rtl_active", False)
+        rtl_blinking = getattr(self, "rtl_blinking", False)
+        if not self.low_battery_alert_active and not rtl_active:
             self.flight_batt_effect.setOpacity(1.0)
             self.battery_alert_effect.setOpacity(0.0)
             self.land_mode_button.setStyleSheet("")
+            self.rtl_mode_button.setStyleSheet("")
+            self.low_battery_flash_timer.stop()
             return
         fade_step = 5.0 / 255.0
         self.low_battery_alert_alpha += fade_step * self.low_battery_alert_direction
@@ -2771,6 +3061,32 @@ class MainWindow(QMainWindow):
         elif self.low_battery_alert_alpha <= 0.0:
             self.low_battery_alert_alpha = 0.0
             self.low_battery_alert_direction = 1.0
+
+        if rtl_blinking:
+            if self.low_battery_alert_alpha >= 0.5:
+                self.rtl_mode_button.setStyleSheet(
+                    "background: #c62828; border: 1px solid #ff5252; color: #ffffff; font-weight: bold;"
+                )
+            else:
+                self.rtl_mode_button.setStyleSheet(
+                    "background: #4a0e0e; border: 1px solid #8e0000; color: #ff867c; font-weight: bold;"
+                )
+        else:
+            self.rtl_mode_button.setStyleSheet("")
+
+        if rtl_active:
+            self.flight_batt_effect.setOpacity(1.0)
+            self.battery_alert_effect.setOpacity(self.low_battery_alert_alpha)
+            self.battery_alert_label.setText(self._tr("returning_to_launch"))
+            if not self.low_battery_alert_active:
+                self.land_mode_button.setStyleSheet("")
+                return
+
+        if not self.low_battery_alert_active:
+            self.flight_batt_effect.setOpacity(1.0)
+            self.battery_alert_effect.setOpacity(0.0)
+            self.land_mode_button.setStyleSheet("")
+            return
         if self.battery_alert_state == "landing":
             self.flight_batt_effect.setOpacity(1.0)
         else:
@@ -3047,6 +3363,16 @@ class MainWindow(QMainWindow):
         elif sensor_key == "dht":
             for widget in (self.humidity_gauge, self.temperature_gauge):
                 widget.set_active_state(active)
+        elif sensor_key == "geiger":
+            self.radiation_card.set_active_state(active)
+            if active:
+                green_color = "#1f9d60" if getattr(self, "current_theme", "dark") == "light" else "#00e676"
+                style = f"color: {green_color}; font-weight: bold;"
+                self.radiation_info_label.setStyleSheet(style)
+                self.radiation_dose_label.setStyleSheet(style)
+            else:
+                self.radiation_info_label.setStyleSheet("")
+                self.radiation_dose_label.setStyleSheet("")
 
     def _start_workers(self) -> None:
         self.thermal_receiver.start()
@@ -3061,10 +3387,10 @@ class MainWindow(QMainWindow):
     def _show_no_signal_overlay(self) -> None:
         self.video_label.setPixmap(QPixmap())
         self.video_label.setText("")
-        self.video_overlay.setText(self._tr("no_signal"))
-        if not self.video_overlay_timer.isActive():
-            self.video_overlay_timer.start()
-        self.video_overlay.show()
+        self.video_overlay.hide()
+        self.video_overlay_timer.stop()
+        if hasattr(self, "video_osd"):
+            self.video_osd.update_frame(None)
 
     def _update_video_overlay_fade(self) -> None:
         fade_step = 3.0 / 255.0
@@ -3354,61 +3680,52 @@ class MainWindow(QMainWindow):
         self.video_overlay_timer.stop()
         if hasattr(self, "video_label") and not self.video_label.isHidden():
             pixmap = QPixmap.fromImage(current_frame)
-            scaled = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            scaled = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
             self.video_label.setPixmap(scaled)
             self.video_label.setText("")
 
     def _record_current_data(self) -> None:
         time_label = datetime.now().strftime("%H:%M:%S")
-        self.csv_writer.writerow(
-            [
-                time_label,
-                self.current_data.co2,
-                self.current_data.lpg,
-                self.current_data.co,
-                self.current_data.humidity,
-                self.current_data.radiation,
-                self.current_data.temperature,
-                self.current_data.pitch,
-                self.current_data.roll,
-                self.current_data.heading,
-                self.current_data.gps_speed,
-                self.current_data.altitude,
-                self.current_data.battery,
-                self.current_data.latitude,
-                self.current_data.longitude,
-            ]
+        recorded_at = datetime.now().isoformat(timespec="seconds")
+        csv_row = [
+            time_label,
+            self.current_data.co2,
+            self.current_data.lpg,
+            self.current_data.co,
+            self.current_data.humidity,
+            self.current_data.radiation,
+            self.current_data.temperature,
+            self.current_data.pitch,
+            self.current_data.roll,
+            self.current_data.heading,
+            self.current_data.gps_speed,
+            self.current_data.altitude,
+            self.current_data.battery,
+            self.current_data.latitude,
+            self.current_data.longitude,
+        ]
+        db_params = (
+            self.log_file_path,
+            self.session_id,
+            recorded_at,
+            time_label,
+            self.current_data.co2,
+            self.current_data.lpg,
+            self.current_data.co,
+            self.current_data.humidity,
+            self.current_data.radiation,
+            self.current_data.temperature,
+            self.current_data.pitch,
+            self.current_data.roll,
+            self.current_data.heading,
+            self.current_data.gps_speed,
+            self.current_data.altitude,
+            self.current_data.battery,
+            self.current_data.latitude,
+            self.current_data.longitude,
         )
-        self.log_handle.flush()
-        self.database.execute(
-            """
-            INSERT INTO telemetry_samples(
-                session_id, recorded_at, time_label, co2, lpg, co, humidity,
-                radiation, temperature, pitch, roll, heading, speed, altitude,
-                battery, latitude, longitude
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                self.session_id,
-                datetime.now().isoformat(timespec="seconds"),
-                time_label,
-                self.current_data.co2,
-                self.current_data.lpg,
-                self.current_data.co,
-                self.current_data.humidity,
-                self.current_data.radiation,
-                self.current_data.temperature,
-                self.current_data.pitch,
-                self.current_data.roll,
-                self.current_data.heading,
-                self.current_data.gps_speed,
-                self.current_data.altitude,
-                self.current_data.battery,
-                self.current_data.latitude,
-                self.current_data.longitude,
-            ),
-        )
-        self.database.commit()
+        if hasattr(self, "_data_writer") and self._data_writer is not None:
+            self._data_writer.enqueue(csv_row, db_params)
 
         # ── Graphique de vol temps réel ───────────────────────────────────────
         if hasattr(self, "flight_data_chart"):
@@ -3542,6 +3859,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._position_floating_panels)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if getattr(self, "rtl_active", False):
+            self._stop_rtl_alert()
         self.record_timer.stop()
         self.radiation_spectrum_timer.stop()
         self.low_battery_flash_timer.stop()
@@ -3562,7 +3881,15 @@ class MainWindow(QMainWindow):
         self.thermal_receiver.wait(1500)
         self.command_client.wait(1500)
 
-        self.log_handle.close()
+        if hasattr(self, "_data_writer") and self._data_writer is not None:
+            self._data_writer.stop()
+            self._data_writer.wait(2000)
+
+        if getattr(self, "log_handle", None) is not None:
+            try:
+                self.log_handle.close()
+            except Exception:
+                pass
         self.database.close()
         super().closeEvent(event)
 
